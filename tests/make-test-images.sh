@@ -84,4 +84,10 @@ if type -P mkfs.erofs >/dev/null; then
     d=$(mktemp -d); echo hello >"$d/hello.txt"
     mkfs.erofs erofs.img "$d" >/dev/null 2>&1; rm -rf "$d"
 fi
+if type -P cryptsetup >/dev/null; then
+    # locked container: dirtybit must list it and skip it without touching it
+    mk luks-locked.img 32M
+    printf 'dirtybit-test' | cryptsetup luksFormat -q --type luks2 --pbkdf pbkdf2 \
+        --pbkdf-force-iterations 1000 --key-file=- luks-locked.img >/dev/null 2>&1 || rm -f luks-locked.img
+fi
 ls -1 ./*.img

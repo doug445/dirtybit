@@ -3,6 +3,10 @@
 # they carry with the right tool, and clear "dirty" / "not cleanly unmounted"
 # markers. Normally invoked through the `dirtybit` alias the installer sets up.
 #
+# Idempotent: every filesystem gets a read-only check first and is written to
+# only when that check or its dirty flag says so. Locked LUKS/BitLocker volumes
+# are out of scope — unlock them first and the inner filesystem is checked.
+#
 # Page-size aware: reports when a filesystem's block size (e.g. 16K btrfs /
 # XFS / ext4 / F2FS made on Asahi or other aarch64 16K/64K-page kernels) can't
 # be mounted on the running kernel — userspace fsck still works either way.
@@ -26,7 +30,7 @@ KREL=$(uname -r)
 
 # ── options ────────────────────────────────────────────────────────────────
 ASSUME_YES=0 DRY_RUN=0 LIST_ONLY=0 REPAIR=0 ZERO_LOG=0 REMOUNT=1
-ALL_REMOVABLE=0 LUKS_MODE=ask USE_COLOR=auto VERBOSE=0 BATCH_OK=0 SQUATTED=0
+ALL_REMOVABLE=0 USE_COLOR=auto VERBOSE=0 BATCH_OK=0 SQUATTED=0
 DEV_ARGS=() IMG_ARGS=()
 
 usage() {
@@ -37,8 +41,11 @@ Usage: $PROG [options] [DEVICE|IMAGE ...]
 
 With no arguments every USB-attached disk is scanned (the disk hosting the
 running system is always excluded), each filesystem found on it is listed,
-and after one confirmation each is unmounted, checked/repaired with the
-matching tool, has its dirty flag cleared, and is remounted.
+and after one confirmation each is unmounted, checked read-only with the
+matching tool, repaired + has its dirty flag cleared only if needed, and is
+remounted. Idempotent: a healthy drive is never written to, so running it
+again changes nothing. Encrypted volumes (LUKS, BitLocker) must be unlocked
+first — e.g. from your file manager — and the unlocked filesystem is checked.
 
 Options
   -l, --list            list detected USB filesystems + state, change nothing
@@ -47,8 +54,6 @@ Options
   -d, --device DEV      only this device (disk, partition or mapper); repeatable
   -i, --image FILE      check a filesystem/disk image file instead; repeatable
   -a, --all-removable   also include non-USB removable/hot-plug disks (SD, …)
-      --luks            unlock LUKS/BitLocker volumes (asks for the passphrase)
-      --no-luks         never offer to unlock encrypted volumes
       --repair          btrfs: run 'btrfs check --repair' (dangerous, last resort)
       --zero-log        XFS/btrfs: if a dirty log can't be replayed on this
                         kernel (e.g. 16K-block FS on a 4K-page kernel), zero it
@@ -60,7 +65,7 @@ Options
   -h, --help            this help
 
 Exit status: 0 all clean/fixed · 1 errors remain · 2 usage · 3 nothing found ·
-             4 some filesystems skipped (missing tool, busy, encrypted)
+             4 some filesystems skipped (missing tool, busy, locked, incompatible)
 EOF
 }
 
@@ -87,8 +92,6 @@ while (($#)); do
         -i|--image)          (($# >= 2)) || die_usage "$1 needs an argument"; IMG_ARGS+=("$2"); shift ;;
         --image=*)           IMG_ARGS+=("${1#*=}") ;;
         -a|--all-removable)  ALL_REMOVABLE=1 ;;
-        --luks)              LUKS_MODE=yes ;;
-        --no-luks)           LUKS_MODE=no ;;
         --repair)            REPAIR=1 ;;
         --zero-log|--force-zero-log) ZERO_LOG=1 ;;
         --no-remount)        REMOUNT=0 ;;
@@ -194,7 +197,6 @@ pkg_hint() { # fs → package that provides its checker on this distro
         reiserfs)          echo reiserfsprogs ;;
         udf)               echo udftools ;;
         nilfs2)            echo nilfs-utils ;;
-        crypto_LUKS|BitLocker) echo cryptsetup ;;
         *)                 echo "?" ;;
     esac
 }
@@ -407,7 +409,7 @@ fs_state() {
         iso9660|squashfs|cramfs|erofs) ST=n/a ST_NOTE="read-only filesystem" ;;
         nilfs2) ST=n/a ST_NOTE="log-structured, recovers on mount" ;;
         swap) ST=n/a ST_NOTE="swap area" ;;
-        crypto_LUKS|BitLocker) ST=n/a ST_NOTE="encrypted container" ;;
+        crypto_LUKS|BitLocker) ST=n/a ST_NOTE="locked encrypted volume — unlock it first" ;;
     esac
     if [[ -z $BS ]]; then
         BS=$(blkid -p -o value -s BLOCK_SIZE -- "$dev" 2>/dev/null)
@@ -522,39 +524,79 @@ mount_replay() { # dev fs kind → mount+umount once so the kernel replays the l
     return 1
 }
 
-# ── checkers: return 0 ok · 1 errors remain · 3 missing tool ──────────────
-# They may set R_FIXED=1 when the tool reports it repaired something.
+# ── checkers ───────────────────────────────────────────────────────────────
+# Each filesystem has a pair:
+#   ro_<ck>  read-only check                 → 0 clean · 1 problems · 3 can't handle here
+#   rw_<ck>  repair + clear the dirty markers → 0 ok    · 1 errors remain · 3 can't handle here
+# run_check drives them idempotently: a filesystem that is not flagged dirty
+# gets the read-only pass only, and is written to only if that pass finds
+# something. A second run over a healthy drive therefore changes nothing.
+# rw_ may set R_FIXED=1 when the tool reports it repaired something.
 
-check_vfat() {
-    local dev=$1 t rc
-    t=$(first_tool fsck.fat fsck.vfat dosfsck) || { missing_tool vfat fsck.fat; return; }
-    if ((DRY_RUN)); then
-        run_tool "$t" -n "$dev"; rc=$?
-        ((rc == 0)) && return 0
-        # fsck.fat -n exits 1 for a mere dirty bit; only count other findings as errors
-        if ((rc == 1)) && ! grep -vqE "^(fsck\.fat|dosfsck) |^There are differences between boot sector and its backup|^This is mostly harmless|^  (37|65):[0-9a-f]{2}/[0-9a-f]{2}$|^  Not automatically fixing this|^FATs differ but appear to be intact|^  Using first FAT|^Dirty bit is set|^ Automatically removing dirty bit|^Leaving filesystem unchanged|: [0-9]+ files, [0-9]+/[0-9]+ clusters$|^$" "$LAST_OUT"; then
+VERIFY_CK=" vfat exfat ntfs hfs btrfs "   # weak/manual repairs: re-check read-only afterwards
+RO_FAILED=0
+
+run_check() { # ck dev kind → 0 · 1 · 3
+    local ck=$1 dev=$2 kind=$3 rc saved
+    RO_FAILED=0
+    if ((DRY_RUN)); then "ro_$ck" "$dev" "$kind"; return; fi
+    if [[ $PRE_ST != dirty ]]; then
+        "ro_$ck" "$dev" "$kind"; rc=$?
+        ((rc == 3)) && return 3
+        if ((rc == 0)) && [[ $PRE_ST != dirty ]]; then
+            ok "read-only check passed — nothing to repair, nothing written"
             return 0
         fi
-        RMSG="fsck.fat reports problems beyond the dirty bit"
-        return 1
+        RO_FAILED=$((rc != 0))
+        info "repair needed"
+    else
+        info "flagged dirty — repairing"
     fi
+    saved=$RMSG RMSG=""
+    "rw_$ck" "$dev" "$kind"; rc=$?
+    if ((rc != 0)); then [[ -n $RMSG ]] || RMSG=$saved; return "$rc"; fi
+    if [[ $VERIFY_CK == *" $ck "* ]]; then
+        info "verification pass (read-only)"
+        "ro_$ck" "$dev" "$kind" || { RMSG="errors remain after repair${RMSG:+: $RMSG}"; return 1; }
+    fi
+    return 0
+}
+
+# FAT ------------------------------------------------------------------------
+ro_vfat() {
+    local dev=$1 t rc
+    t=$(first_tool fsck.fat fsck.vfat dosfsck) || { missing_tool vfat fsck.fat; return; }
+    run_tool "$t" -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    # fsck.fat -n exits 1 for a mere dirty bit; only other findings are problems
+    if ((rc == 1)) && ! grep -vqE "^(fsck\.fat|dosfsck) |^There are differences between boot sector and its backup|^This is mostly harmless|^  (37|65):[0-9a-f]{2}/[0-9a-f]{2}$|^  Not automatically fixing this|^FATs differ but appear to be intact|^  Using first FAT|^Dirty bit is set|^ Automatically removing dirty bit|^Leaving filesystem unchanged|: [0-9]+ files, [0-9]+/[0-9]+ clusters$|^$" "$LAST_OUT"; then
+        return 0
+    fi
+    RMSG="fsck.fat reports problems beyond the dirty bit"
+    return 1
+}
+rw_vfat() {
+    local dev=$1 t rc
+    t=$(first_tool fsck.fat fsck.vfat dosfsck) || { missing_tool vfat fsck.fat; return; }
     run_tool "$t" -a -w "$dev"; rc=$?
     ((rc >= 2)) && { RMSG="fsck.fat failed (exit $rc)"; return 1; }
     ((rc == 1)) && R_FIXED=1
     fat_clear "$dev"
-    info "verification pass"
-    run_tool "$t" -n "$dev" || { RMSG="errors remain after repair"; return 1; }
     return 0
 }
 
-check_exfat() {
+# exFAT ----------------------------------------------------------------------
+ro_exfat() {
     local dev=$1 t rc
     t=$(first_tool fsck.exfat exfatfsck) || { missing_tool exfat fsck.exfat; return; }
-    if ((DRY_RUN)); then
-        run_tool "$t" -n "$dev"; rc=$?
-        ((rc == 0)) || RMSG="fsck.exfat reports problems"
-        return $((rc == 0 ? 0 : 1))
-    fi
+    run_tool "$t" -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="fsck.exfat reports problems (exit $rc)"
+    return 1
+}
+rw_exfat() {
+    local dev=$1 t rc
+    t=$(first_tool fsck.exfat exfatfsck) || { missing_tool exfat fsck.exfat; return; }
     run_tool "$t" -p "$dev"; rc=$?
     if ((rc & 4)) && confirm "preen mode couldn't fix everything — run full repair ($t -y)?"; then
         run_tool "$t" -y "$dev"; rc=$?
@@ -562,36 +604,48 @@ check_exfat() {
     ((rc & ~1)) && { RMSG="fsck.exfat left errors (exit $rc)"; return 1; }
     ((rc == 1)) && R_FIXED=1
     exfat_clear "$dev"
-    info "verification pass"
-    run_tool "$t" -n "$dev" || { RMSG="errors remain after repair"; return 1; }
     return 0
 }
 
-check_ntfs() {
+# NTFS -----------------------------------------------------------------------
+ntfs_hibernated() {
+    if grep -qi 'hibernat' "$LAST_OUT"; then
+        RMSG="Windows is hibernated / Fast Startup — boot Windows and shut down fully ('shutdown /s /t 0')"
+        return 0
+    fi
+    return 1
+}
+ro_ntfs() {
     local dev=$1 rc
     have ntfsfix || { missing_tool ntfs ntfsfix; return; }
-    if ((DRY_RUN)); then
-        run_tool ntfsfix -n "$dev"; rc=$?
-        return $((rc == 0 ? 0 : 1))
-    fi
+    run_tool ntfsfix -n "$dev"; rc=$?
+    ntfs_hibernated && return 3
+    ((rc == 0)) && return 0
+    RMSG="ntfsfix -n reports problems (exit $rc)"
+    return 1
+}
+rw_ntfs() {
+    local dev=$1 rc
+    have ntfsfix || { missing_tool ntfs ntfsfix; return; }
     run_tool ntfsfix -d "$dev"; rc=$?
-    if grep -qi 'hibernat' "$LAST_OUT"; then
-        RMSG="Windows is hibernated / Fast Startup — boot Windows and shut down fully (or 'shutdown /s /t 0')"
-        return 1
-    fi
+    ntfs_hibernated && return 3
     ((rc == 0)) || { RMSG="ntfsfix failed (exit $rc) — run 'chkdsk /f' on Windows"; return 1; }
     info "ntfsfix only fixes basic inconsistencies; for a full check run 'chkdsk X: /f' on Windows"
     return 0
 }
 
-check_ext() {
+# ext2/3/4 -------------------------------------------------------------------
+ro_ext() {
     local dev=$1 rc
     have e2fsck || { missing_tool ext4 e2fsck; return; }
-    if ((DRY_RUN)); then
-        run_tool e2fsck -f -n "$dev"; rc=$?
-        ((rc == 0)) || RMSG="e2fsck reports problems (a pending journal is not replayed in dry-run)"
-        return $((rc == 0 ? 0 : 1))
-    fi
+    run_tool e2fsck -f -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="e2fsck -n reports problems (exit $rc; a pending journal is not replayed read-only)"
+    return 1
+}
+rw_ext() {
+    local dev=$1 rc
+    have e2fsck || { missing_tool ext4 e2fsck; return; }
     run_tool e2fsck -f -p "$dev"; rc=$?
     if ((rc & 4)) && confirm "preen mode stopped on a problem it won't fix alone — run 'e2fsck -f -y'?"; then
         run_tool e2fsck -f -y "$dev"; rc=$?
@@ -601,42 +655,64 @@ check_ext() {
     return 0
 }
 
-check_btrfs() {
+# btrfs ----------------------------------------------------------------------
+ro_btrfs() {
     local dev=$1 kind=$2 rc
     have btrfs || { missing_tool btrfs btrfs; return; }
     [[ $kind == blk ]] && btrfs device scan "$dev" >/dev/null 2>&1
-    if [[ $PRE_ST == dirty ]] && ((!DRY_RUN)); then
+    run_tool btrfs check --readonly --progress "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="btrfs check found errors — try mounting + 'btrfs scrub', or 'btrfs rescue'; --repair only as a last resort"
+    return 1
+}
+rw_btrfs() {
+    local dev=$1 kind=$2 rc
+    have btrfs || { missing_tool btrfs btrfs; return; }
+    [[ $kind == blk ]] && btrfs device scan "$dev" >/dev/null 2>&1
+    if [[ $PRE_ST == dirty ]]; then
         if [[ $PC != no ]] && mount_replay "$dev" btrfs "$kind"; then
             R_FIXED=1
         elif ((ZERO_LOG)) && confirm "zero the btrfs log tree on $dev (drops the last fsync'd writes)?"; then
-            run_tool btrfs rescue zero-log "$dev" && R_FIXED=1
+            run_tool btrfs rescue zero-log "$dev" || { RMSG="btrfs rescue zero-log failed"; return 1; }
+            R_FIXED=1
         else
-            warn "log tree left in place — it replays on the next mount on a kernel that supports sectorsize ${BS:-?}${PC_NOTE:+ ($PC_NOTE)}; or use --zero-log"
+            run_tool btrfs check --readonly --progress "$dev"
+            RMSG="fsync log tree can't be replayed here${PC_NOTE:+ ($PC_NOTE)} — it replays on the next mount on a kernel that supports sectorsize ${BS:-?}, or use --zero-log"
+            return 3
         fi
     fi
-    if ((REPAIR && !DRY_RUN)); then
-        warn "'btrfs check --repair' can make damage worse; back up first if you can"
-        if confirm "really run btrfs check --repair on $dev?"; then
+    if ((RO_FAILED)); then
+        if ((REPAIR)) && { warn "'btrfs check --repair' can make damage worse; back up first if you can"
+                           confirm "really run btrfs check --repair on $dev?"; }; then
             run_tool btrfs check --repair "$dev"; rc=$?
-            ((rc == 0)) && R_FIXED=1
             ((rc == 0)) || { RMSG="btrfs check --repair failed (exit $rc)"; return 1; }
-            return 0
+            R_FIXED=1
+        else
+            RMSG="btrfs check found errors — try mounting + 'btrfs scrub', or 'btrfs rescue'; --repair only as a last resort"
+            return 1
         fi
     fi
-    run_tool btrfs check --readonly --progress "$dev"; rc=$?
-    ((rc == 0)) || { RMSG="btrfs check found errors — try mounting + 'btrfs scrub', or 'btrfs rescue'; --repair only as a last resort"; return 1; }
     return 0
 }
 
-check_xfs() {
+# XFS ------------------------------------------------------------------------
+ro_xfs() {
     local dev=$1 kind=$2 rc f=()
     have xfs_repair || { missing_tool xfs xfs_repair; return; }
     [[ $kind == img ]] && f=(-f)
-    if ((DRY_RUN)); then
-        run_tool xfs_repair "${f[@]}" -n "$dev"; rc=$?
-        grep -q 'valuable metadata changes in a log' "$LAST_OUT" && { PRE_ST=dirty; RMSG="dirty log present (would be replayed)"; }
-        return $((rc == 0 ? 0 : 1))
+    run_tool xfs_repair "${f[@]}" -n "$dev"; rc=$?
+    if grep -q 'valuable metadata changes in a log' "$LAST_OUT"; then
+        PRE_ST=dirty RMSG="dirty log awaiting replay"
+        return 0                # can't judge the rest until the log is replayed
     fi
+    ((rc == 0)) && return 0
+    RMSG="xfs_repair -n reports problems (exit $rc)"
+    return 1
+}
+rw_xfs() {
+    local dev=$1 kind=$2 rc f=()
+    have xfs_repair || { missing_tool xfs xfs_repair; return; }
+    [[ $kind == img ]] && f=(-f)
     run_tool xfs_repair "${f[@]}" "$dev"; rc=$?
     if ((rc == 2)); then
         PRE_ST=dirty
@@ -648,76 +724,102 @@ check_xfs() {
             R_FIXED=1
         else
             RMSG="dirty XFS log can't be replayed here${PC_NOTE:+ ($PC_NOTE)} — plug it into a machine whose kernel can mount it, or use --zero-log"
-            return 1
-        fi
-    fi
-    ((rc == 0)) || { RMSG="xfs_repair failed (exit $rc)"; return 1; }
-    # xfs_repair's phase banners always mention "moving"/"clearing"; only these mean a real fix
-    grep -qE '^(junking|clearing (inode|entry|forw|back)|correcting|fixing|rebuilding directory|resetting .* to)' "$LAST_OUT" && R_FIXED=1
-    return 0
-}
-
-check_f2fs() {
-    local dev=$1 rc
-    have fsck.f2fs || { missing_tool f2fs fsck.f2fs; return; }
-    # F2FS block size == the page size of the kernel that formatted it, so
-    # aarch64 16K-page kernels (Asahi etc.) produce 16K-block F2FS. f2fs-tools
-    # before 1.17 hard-code 4K blocks and cannot read those at all.
-    if [[ -n $BS ]] && ((BS != 4096)); then
-        local ver maj min
-        ver=$(fsck.f2fs -V 2>&1 | sed -n 's/.*fsck.f2fs \([0-9][0-9.]*\).*/\1/p' | head -n1)
-        IFS=. read -r maj min _ <<<"${ver:-0.0}"
-        if ((${maj:-0} < 1 || (${maj:-0} == 1 && ${min:-0} < 17))); then
-            RMSG="${BS}-byte-block F2FS (made on a $((BS / 1024))K-page kernel) needs f2fs-tools ≥ 1.17; this is ${ver:-unknown} — check it on the aarch64 machine or upgrade f2fs-tools"
-            err "$RMSG"
             return 3
         fi
     fi
-    if ((DRY_RUN)); then
-        run_tool fsck.f2fs -f --dry-run "$dev"; rc=$?
-    else
-        run_tool fsck.f2fs -f -y "$dev"; rc=$?
-    fi
-    # fsck.f2fs can exit 0 even when it found no superblock
-    if grep -qE "Can't find a valid F2FS superblock|Invalid argument|Failed to" "$LAST_OUT" &&
-        ! grep -q '^Info: checkpoint state' "$LAST_OUT"; then
-        RMSG="fsck.f2fs could not read the filesystem"
-        return 1
-    fi
-    ((DRY_RUN)) && return $((rc == 0 ? 0 : 1))
-    ((rc == 1)) && R_FIXED=1
-    ((rc <= 1)) || { RMSG="fsck.f2fs failed (exit $rc)"; return 1; }
-    grep -q '\[Fail\]' "$LAST_OUT" && R_FIXED=1
+    ((rc == 0)) || { RMSG="xfs_repair failed (exit $rc)"; return 1; }
+    ((RO_FAILED)) && R_FIXED=1
     return 0
 }
 
-check_hfs() {
+# F2FS -----------------------------------------------------------------------
+f2fs_usable() {
+    # F2FS block size == the page size of the kernel that formatted it, so
+    # aarch64 16K-page kernels (Asahi etc.) produce 16K-block F2FS. f2fs-tools
+    # before 1.17 hard-code 4K blocks and cannot read those at all.
+    have fsck.f2fs || { missing_tool f2fs fsck.f2fs; return; }
+    [[ -n $BS ]] && ((BS != 4096)) || return 0
+    local ver maj min
+    ver=$(fsck.f2fs -V 2>&1 | sed -n 's/.*fsck.f2fs \([0-9][0-9.]*\).*/\1/p' | head -n1)
+    IFS=. read -r maj min _ <<<"${ver:-0.0}"
+    if ((${maj:-0} < 1 || (${maj:-0} == 1 && ${min:-0} < 17))); then
+        RMSG="${BS}-byte-block F2FS (made on a $((BS / 1024))K-page kernel) needs f2fs-tools ≥ 1.17; this is ${ver:-unknown} — check it on the aarch64 machine or upgrade f2fs-tools"
+        err "$RMSG"
+        return 3
+    fi
+    return 0
+}
+f2fs_unreadable() { # fsck.f2fs can exit 0 even when it found no superblock
+    grep -qE "Can't find a valid F2FS superblock|Invalid argument|Failed to" "$LAST_OUT" &&
+        ! grep -q '^Info: checkpoint state' "$LAST_OUT"
+}
+ro_f2fs() {
+    local dev=$1 rc
+    f2fs_usable || return
+    run_tool fsck.f2fs -f --dry-run "$dev"; rc=$?
+    f2fs_unreadable && { RMSG="fsck.f2fs could not read the filesystem"; return 1; }
+    if ((rc == 0)) && ! grep -q '\[Fail\]' "$LAST_OUT"; then return 0; fi
+    RMSG="fsck.f2fs reports problems"
+    return 1
+}
+rw_f2fs() {
+    local dev=$1 rc
+    f2fs_usable || return
+    run_tool fsck.f2fs -f -y "$dev"; rc=$?
+    f2fs_unreadable && { RMSG="fsck.f2fs could not read the filesystem"; return 1; }
+    ((rc <= 1)) || { RMSG="fsck.f2fs failed (exit $rc)"; return 1; }
+    { ((rc == 1)) || grep -q '\[Fail\]' "$LAST_OUT"; } && R_FIXED=1
+    return 0
+}
+
+# HFS / HFS+ -----------------------------------------------------------------
+ro_hfs() {
     local dev=$1 t rc
     t=$(first_tool fsck.hfsplus fsck.hfs) || { missing_tool hfsplus fsck.hfsplus; return; }
-    if ((DRY_RUN)); then
-        run_tool "$t" -f -n "$dev"; rc=$?
-        return $((rc == 0 ? 0 : 1))
-    fi
+    run_tool "$t" -f -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="$t reports problems (exit $rc)"
+    return 1
+}
+rw_hfs() {
+    local dev=$1 t rc
+    t=$(first_tool fsck.hfsplus fsck.hfs) || { missing_tool hfsplus fsck.hfsplus; return; }
     run_tool "$t" -f -y "$dev"; rc=$?
     grep -qi 'repaired successfully' "$LAST_OUT" && R_FIXED=1
     ((rc == 0)) || { RMSG="$t failed (exit $rc) — repair with macOS Disk Utility (First Aid)"; return 1; }
     return 0
 }
 
-check_jfs() {
+# JFS ------------------------------------------------------------------------
+ro_jfs() {
     local dev=$1 rc
     have fsck.jfs || { missing_tool jfs fsck.jfs; return; }
-    if ((DRY_RUN)); then run_tool fsck.jfs -n "$dev"; rc=$?; return $((rc == 0 ? 0 : 1)); fi
+    run_tool fsck.jfs -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="fsck.jfs -n reports problems (exit $rc)"
+    return 1
+}
+rw_jfs() {
+    local dev=$1 rc
+    have fsck.jfs || { missing_tool jfs fsck.jfs; return; }
     run_tool fsck.jfs -f -p "$dev"; rc=$?
     ((rc & 3)) && R_FIXED=1
     ((rc & ~3)) && { RMSG="fsck.jfs left errors (exit $rc)"; return 1; }
     return 0
 }
 
-check_bcachefs() {
+# bcachefs -------------------------------------------------------------------
+ro_bcachefs() {
     local dev=$1 rc
     have bcachefs || { missing_tool bcachefs bcachefs; return; }
-    if ((DRY_RUN)); then run_tool bcachefs fsck -n "$dev"; rc=$?; return $((rc == 0 ? 0 : 1)); fi
+    run_tool bcachefs fsck -n "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="bcachefs fsck -n reports problems (exit $rc)"
+    return 1
+}
+rw_bcachefs() {
+    local dev=$1 rc
+    have bcachefs || { missing_tool bcachefs bcachefs; return; }
     run_tool bcachefs fsck -p "$dev"; rc=$?
     if ((rc & 4)) && confirm "run 'bcachefs fsck -y' to fix the remaining errors?"; then
         run_tool bcachefs fsck -y "$dev"; rc=$?
@@ -727,71 +829,44 @@ check_bcachefs() {
     return 0
 }
 
-check_apfs() {
-    local dev=$1 rc t
+# check-only filesystems -----------------------------------------------------
+ro_apfs() {
+    local dev=$1 t rc
     t=$(first_tool fsck.apfs apfsck) || { missing_tool apfs fsck.apfs; return; }
     run_tool "$t" "$dev"; rc=$?
-    info "fsck.apfs is check-only; repairs need macOS Disk Utility"
-    ((rc == 0)) || { RMSG="fsck.apfs found problems — run First Aid on a Mac"; return 1; }
-    return 0
+    ((rc == 0)) && return 0
+    RMSG="$t found problems"
+    return 1
 }
+rw_apfs() { RMSG="apfsprogs can't repair APFS — run First Aid in macOS Disk Utility"; return 1; }
 
-check_erofs() {
-    local dev=$1
-    have fsck.erofs || { RMSG="read-only filesystem; install erofs-utils to verify it"; return 0; }
-    run_tool fsck.erofs "$dev" || { RMSG="fsck.erofs found corruption (image is read-only — rebuild it)"; return 1; }
-    return 0
+ro_erofs() {
+    run_tool fsck.erofs "$1" && return 0
+    RMSG="fsck.erofs found corruption"
+    return 1
 }
+rw_erofs() { RMSG="EROFS is a read-only image format — rebuild the image"; return 1; }
 
-check_reiserfs() {
+ro_udf() { return 0; }   # state comes from udfinfo in fs_state; there is no Linux UDF fsck
+rw_udf() { RMSG="no Linux fsck exists for UDF; Windows 'chkdsk /f' can repair it"; return 1; }
+
+# ReiserFS -------------------------------------------------------------------
+ro_reiserfs() {
     local dev=$1 rc
     have reiserfsck || { missing_tool reiserfs reiserfsck; return; }
     warn "ReiserFS was removed from Linux 6.13 — copy the data off this drive"
-    if ((DRY_RUN)); then run_tool reiserfsck --check --yes "$dev"; rc=$?; return $((rc == 0 ? 0 : 1)); fi
+    run_tool reiserfsck --check --yes "$dev"; rc=$?
+    ((rc == 0)) && return 0
+    RMSG="reiserfsck --check reports problems (exit $rc)"
+    return 1
+}
+rw_reiserfs() {
+    local dev=$1 rc
+    have reiserfsck || { missing_tool reiserfs reiserfsck; return; }
     run_tool reiserfsck --fix-fixable --yes "$dev"; rc=$?
     ((rc == 1)) && R_FIXED=1
     ((rc <= 1)) || { RMSG="reiserfsck exit $rc — see its output for the --rebuild-tree advice"; return 1; }
     return 0
-}
-
-check_udf() {
-    RMSG="no Linux fsck exists for UDF; Windows 'chkdsk /f' can repair it"
-    [[ $PRE_ST == dirty ]] && return 1
-    return 0
-}
-
-# ── encrypted containers ───────────────────────────────────────────────────
-OPENED_MAPS=()
-handle_crypt() { # dev fs kind
-    local dev=$1 fs=$2 kind=$3 name inner ifs type=luks ro=()
-    [[ $fs == BitLocker ]] && type=bitlk
-    have cryptsetup || { missing_tool "$fs" cryptsetup; RS=SKIPPED; return; }
-    case $LUKS_MODE in
-        no) RS=SKIPPED RMSG="encrypted ($fs) — skipped (--no-luks)"; return ;;
-        ask)
-            if ((ASSUME_YES)) || ! confirm "$dev is encrypted ($fs). Unlock it to check the filesystem inside?"; then
-                RS=SKIPPED RMSG="encrypted ($fs) — pass --luks to unlock and check it"; return
-            fi ;;
-    esac
-    ((EUID == 0)) || { RS=SKIPPED RMSG="unlocking needs root"; return; }
-    name="dirtybit-$(basename "$dev")"
-    ((DRY_RUN)) && ro=(--readonly)
-    info "unlocking $dev as /dev/mapper/$name"
-    if ! cryptsetup open --type "$type" "${ro[@]}" -- "$dev" "$name" </dev/tty; then
-        RS=SKIPPED RMSG="could not unlock $dev"; return
-    fi
-    OPENED_MAPS+=("$name")
-    udevadm settle 2>/dev/null
-    inner=/dev/mapper/$name
-    ifs=$(probe_type "$inner")
-    if [[ -z $ifs ]]; then
-        RS=SKIPPED RMSG="no filesystem found inside $fs container"
-    else
-        info "inside: $ifs"
-        process_fs "$inner" "$ifs" blk
-        RMSG="[via $fs] $RMSG"
-    fi
-    cryptsetup close "$name" 2>/dev/null && OPENED_MAPS=("${OPENED_MAPS[@]/$name/}")
 }
 
 # ── main per-filesystem pipeline ───────────────────────────────────────────
@@ -799,29 +874,33 @@ declare -A UNMOUNTED_PENDING=()
 RS="" RMSG="" R_FIXED=0 PRE_ST="" PC="-" PC_NOTE=""
 
 process_fs() { # dev fs kind(blk|img) → RS, RMSG
-    local dev=$1 fs=$2 kind=$3 checker rc did_unmount=0 pre_note
+    local dev=$1 fs=$2 kind=$3 ck rc did_unmount=0 pre_note
     RS="" RMSG="" R_FIXED=0
     case $fs in
-        crypto_LUKS|BitLocker) handle_crypt "$dev" "$fs" "$kind"; return ;;
+        crypto_LUKS|BitLocker)
+            RS=SKIPPED RMSG="locked $fs volume — unlocking is outside dirtybit's scope: unlock it (file manager, or 'udisksctl unlock -b $dev') and re-run; the unlocked filesystem is then checked"
+            return ;;
         swap) RS=NA RMSG="swap area — nothing to check"; return ;;
         LVM2_member|linux_raid_member|zfs_member|ceph_bluestore|vdo|drbd|isw_raid_member|ddf_raid_member)
             RS=SKIPPED RMSG="$fs container — activate it, then run: $PROG -d <inner device>"; return ;;
         iso9660|squashfs|cramfs) RS=NA RMSG="read-only filesystem — no dirty state"; return ;;
         nilfs2) RS=NA RMSG="log-structured; self-recovers on mount — no dirty bit to clear"; return ;;
-        vfat|msdos)            checker=check_vfat; fs=vfat ;;
-        exfat)                 checker=check_exfat ;;
-        ntfs|ntfs3)            checker=check_ntfs; fs=ntfs ;;
-        ext2|ext3|ext4|ext4dev) checker=check_ext ;;
-        btrfs)                 checker=check_btrfs ;;
-        xfs)                   checker=check_xfs ;;
-        f2fs)                  checker=check_f2fs ;;
-        hfsplus|hfs)           checker=check_hfs ;;
-        jfs)                   checker=check_jfs ;;
-        bcachefs)              checker=check_bcachefs ;;
-        apfs)                  checker=check_apfs ;;
-        erofs)                 checker=check_erofs ;;
-        reiserfs)              checker=check_reiserfs ;;
-        udf)                   checker=check_udf ;;
+        erofs)
+            have fsck.erofs || { RS=NA RMSG="read-only filesystem (install erofs-utils to verify it)"; return; }
+            ck=erofs ;;
+        vfat|msdos)             ck=vfat; fs=vfat ;;
+        exfat)                  ck=exfat ;;
+        ntfs|ntfs3)             ck=ntfs; fs=ntfs ;;
+        ext2|ext3|ext4|ext4dev) ck=ext ;;
+        btrfs)                  ck=btrfs ;;
+        xfs)                    ck=xfs ;;
+        f2fs)                   ck=f2fs ;;
+        hfsplus|hfs)            ck=hfs ;;
+        jfs)                    ck=jfs ;;
+        bcachefs)               ck=bcachefs ;;
+        apfs)                   ck=apfs ;;
+        reiserfs)               ck=reiserfs ;;
+        udf)                    ck=udf ;;
         *) RS=SKIPPED RMSG="unsupported filesystem type '$fs'"; return ;;
     esac
 
@@ -856,8 +935,8 @@ process_fs() { # dev fs kind(blk|img) → RS, RMSG
         [[ $PC == no && $fs != f2fs ]] && info "userspace fsck doesn't depend on the kernel page size — checking anyway"
     fi
 
-    # 3. check/repair
-    "$checker" "$dev" "$kind"; rc=$?
+    # 3. read-only check → repair only if needed → verify
+    run_check "$ck" "$dev" "$kind"; rc=$?
     [[ $kind == blk ]] && blockdev --flushbufs "$dev" 2>/dev/null
     sync
 
@@ -1043,10 +1122,7 @@ need_root() {
 }
 
 cleanup() {
-    local n d
-    for n in "${OPENED_MAPS[@]+"${OPENED_MAPS[@]}"}"; do
-        [[ -n $n && -e /dev/mapper/$n ]] && cryptsetup close "$n" 2>/dev/null
-    done
+    local d
     for d in "${LOOPS[@]+"${LOOPS[@]}"}"; do losetup -d "$d" 2>/dev/null; done
     for d in "${!UNMOUNTED_PENDING[@]}"; do
         warn "$d was unmounted and not remounted — replug it or mount it manually"
@@ -1150,7 +1226,7 @@ main() {
         case ${RES_S[i]} in
             CLEAN) c=$C_G ;; FIXED) c=$C_G ;; NA) c=$C_DIM ;; DIRTY) c=$C_Y ;; SKIPPED) c=$C_Y; ((rc == 0)) && rc=4 ;; ERRORS) c=$C_R; rc=1 ;; *) c="" ;;
         esac
-        printf '  %s%-8s%s %-18s %-9s %s\n' "$c" "${RES_S[i]}" "$C_0" "${T_NAME[i]}" "${T_FS[i]}" "${RES_M[i]}"
+        printf '  %s%-8s%s %-18s %-11s %s\n' "$c" "${RES_S[i]}" "$C_0" "${T_NAME[i]}" "${T_FS[i]}" "${RES_M[i]}"
     done
     [[ -n $LOGFILE ]] && printf '\n  %slog: %s%s\n' "$C_DIM" "$LOGFILE" "$C_0"
     exit "$rc"
